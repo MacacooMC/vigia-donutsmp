@@ -12,31 +12,46 @@ from google.genai import types
 from PIL import Image
 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")  # Flash (no Lite): se inventa mucho menos
 WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
 PASSWORD = os.getenv("ADMIN_PASSWORD", "")
-DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "900"))    # consultas a Gemini por día (todas las cuentas)
+DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "250"))    # consultas a Gemini por día (Flash gratis da menos que Lite)
 PERIODIC = int(os.getenv("PERIODIC_CHECK", "120"))    # revisa la pantalla aunque no abra inventario
+MIN_CONF = float(os.getenv("MIN_CONFIDENCE", "0.8"))  # seguridad mínima de la IA para contar un objeto
 INV_COOLDOWN = 15                                     # mín. segundos entre consultas con inventario abierto
 ALERT_COOLDOWN = 600                                  # no repetir el mismo aviso en 10 min
 FRAME_EVERY = 3                                       # una imagen cada 3 s
-W, H = 960, 540
+W, H = 1280, 720
 
 lock = threading.Lock()
 streamers = {}                     # id -> dict
 alerts = deque(maxlen=40)
 items = [s.strip() for s in os.getenv("ITEMS",
-    "Elytra, cualquier objeto de Netherite (armadura, espada, pico, lingote, bloque), "
-    "Tótem de la inmortalidad, Spawner, Shulker box, Manzana de oro encantada, Beacon").split(",") if s.strip()]
+    "Elytra, Armadura de Netherite, Espada de Netherite, Pico de Netherite, Hacha de Netherite, "
+    "Lingote de Netherite, Bloque de Netherite, Tótem de la inmortalidad, Spawner, Shulker box, "
+    "Manzana de oro encantada, Beacon").split(",") if s.strip()]
 usage = {"day": "", "count": 0}
 client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
 last_call = [0.0]
 
-PROMPT = """Eres experto en Minecraft. Esta es una captura del directo de un jugador de DonutSMP.
-Busca SOLO estos objetos valiosos: {items}.
-Cuenta solo los que lleva el jugador: en su mano, en la barra rápida, en su inventario abierto o en un cofre/shulker que tenga abierto.
-Ignora objetos de otros jugadores, del suelo, de marcos o de tiendas. Si no estás seguro, NO lo pongas.
-Responde solo JSON: {{"items":[{{"name":"nombre en español","count":numero_o_null,"where":"mano|barra|inventario|cofre"}}]}}"""
+PROMPT = """Eres experto en Minecraft. Esta imagen es un recorte del directo de un jugador de DonutSMP: {where}.
+Busca SOLO estos objetos: {items}.
+Cuidado: muchos jugadores usan texture packs y mods de HUD. Los iconos pequeños a la derecha de la barra rápida
+son el indicador de armadura puesta: una pechera NO es una Elytra. Ignora el chat, la webcam, carteles, bloques del mundo
+y objetos de otros jugadores. Si un icono no es inconfundiblemente uno de la lista, NO lo pongas.
+Lo normal es que la lista salga vacía.
+Copia "name" EXACTAMENTE como aparece en la lista.
+Responde solo JSON: {{"items":[{{"name":"...","count":numero_o_null,"confidence":0.0_a_1.0,"seen":"qué icono ves y dónde"}}]}}"""
+
+
+def crop(frame, inv):
+    """Solo la zona que importa, a resolución completa: así los iconos no quedan diminutos."""
+    h, w, _ = frame.shape
+    if inv:
+        return frame[int(h * .05):int(h * .95), int(w * .2):int(w * .8)], "su inventario o cofre abierto"
+    strip = frame[int(h * .75):, int(w * .2):int(w * .8)]
+    big = Image.fromarray(strip).resize((strip.shape[1] * 2, strip.shape[0] * 2), Image.NEAREST)
+    return np.asarray(big), "su barra rápida (abajo) y el indicador de armadura"
 
 
 def take_budget():
@@ -74,21 +89,28 @@ def to_jpg(frame):
     return buf.getvalue()
 
 
-def analyze(jpg):
+def analyze(img, where):
     r = client.models.generate_content(
         model=GEMINI_MODEL,
-        contents=[types.Part.from_bytes(data=jpg, mime_type="image/jpeg"), PROMPT.format(items=", ".join(items))],
+        contents=[types.Part.from_bytes(data=to_jpg(img), mime_type="image/jpeg"),
+                  PROMPT.format(where=where, items=", ".join(items))],
         config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0))
-    return json.loads(r.text).get("items", [])
+    allowed = {i.lower(): i for i in items}
+    out = []
+    for i in json.loads(r.text).get("items", []):
+        name = allowed.get(str(i.get("name", "")).strip().lower())   # fuera lo que no esté en tu lista
+        if name and float(i.get("confidence") or 0) >= MIN_CONF:
+            out.append({**i, "name": name})
+    return out
 
 
 def send_discord(st, found, jpg, reason):
-    lines = "\n".join(f"• **{i.get('name')}**" + (f" x{i['count']}" if i.get("count") else "")
-                      + f" ({i.get('where', '?')})" for i in found)
+    lines = "\n".join(f"• **{i['name']}**" + (f" x{i['count']}" if i.get("count") else "")
+                      + (f" — {i['seen']}" if i.get("seen") else "") for i in found)
     payload = {"username": "Vigía DonutSMP", "embeds": [{
         "title": f"🚨 {st['name']} lleva algo valioso", "url": st["url"], "description": lines,
         "color": 0xE74C3C, "image": {"url": "attachment://captura.jpg"},
-        "footer": {"text": f"Detectado por: {reason}"}}]}
+        "footer": {"text": f"Detectado por: {reason} (confirmado en 2 fotogramas)"}}]}
     if WEBHOOK:
         requests.post(WEBHOOK, data={"payload_json": json.dumps(payload)},
                       files={"files[0]": ("captura.jpg", jpg, "image/jpeg")}, timeout=20)
@@ -102,7 +124,10 @@ def handle_frame(sid, frame):
     st["frame"] = jpg
     now, small, inv = time.time(), thumb(frame), inventory_open(frame)
     changed = st["sent"] is None or np.abs(small - st["sent"]).mean() > 6
-    if inv and changed and now - st["last_ai"] >= INV_COOLDOWN:
+    pend = st["pending"]
+    if pend:                                   # algo visto en el fotograma anterior → confirmar con este
+        reason, inv = pend["reason"], pend["inv"]
+    elif inv and changed and now - st["last_ai"] >= INV_COOLDOWN:
         reason = "inventario abierto"
     elif now - st["last_ai"] >= PERIODIC:
         reason = "revisión periódica"
@@ -114,14 +139,22 @@ def handle_frame(sid, frame):
     if not take_budget():
         st["status"] = "límite diario de IA alcanzado"
         return
-    st["last_ai"], st["sent"] = now, small
+    st["last_ai"], st["sent"], st["pending"] = now, small, None
     try:
-        found = analyze(jpg)
+        found = analyze(*crop(frame, inv))
     except Exception as e:  # cuota, red, JSON raro: se registra y seguimos
         st["status"] = f"error IA: {str(e)[:80]}"
         return
-    st["status"], st["last_items"] = "en directo", found
-    key = ",".join(sorted(str(i.get("name", "")).lower() for i in found))
+    st["status"] = "en directo"
+    if not pend:
+        if found:
+            st["pending"] = {"reason": reason, "inv": inv, "names": {i["name"] for i in found}}
+        else:
+            st["last_items"] = []
+        return
+    found = [i for i in found if i["name"] in pend["names"]]   # solo lo que salió las dos veces
+    st["last_items"] = found
+    key = ",".join(sorted(i["name"] for i in found))
     if not found or (key == st["last_key"] and now - st["last_alert"] < ALERT_COOLDOWN):
         return
     st["last_key"], st["last_alert"] = key, now
@@ -182,7 +215,7 @@ def add_streamer(url):
             return sid
         streamers[sid] = {"url": url, "name": url.split("/")[-1].lstrip("@"), "status": "iniciando",
                           "frame": None, "sent": None, "last_ai": 0, "last_items": [],
-                          "last_key": "", "last_alert": 0}
+                          "last_key": "", "last_alert": 0, "pending": None}
     threading.Thread(target=watch, args=(sid,), daemon=True).start()
     return sid
 
