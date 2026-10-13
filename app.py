@@ -1,5 +1,6 @@
 """Vigía DonutSMP: mira directos, detecta objetos valiosos con Gemini y avisa por Discord."""
-import hashlib, io, json, os, subprocess, threading, time
+import hashlib, io, json, os, re, subprocess, threading, time
+from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from datetime import datetime
 
@@ -12,16 +13,20 @@ from google.genai import types
 from PIL import Image
 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")  # Flash (no Lite): se inventa mucho menos
-FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK", "gemini-flash-lite-latest")  # si el principal está saturado
+# Varias IAs miran la MISMA imagen a la vez y votan. Cada modelo tiene su propio cupo gratis.
+MODELS = [m.strip() for m in os.getenv("MODELS",
+          "gemini-flash-latest,gemini-flash-lite-latest,gemma-3-27b-it").split(",") if m.strip()]
+VOTES = int(os.getenv("VOTES", "2"))                  # cuántas IAs tienen que estar de acuerdo
 WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
 PASSWORD = os.getenv("ADMIN_PASSWORD", "")
-DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "250"))    # consultas a Gemini por día (Flash gratis da menos que Lite)
+DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "400"))    # revisiones por día (cada una consulta a todas las IAs)
 PERIODIC = int(os.getenv("PERIODIC_CHECK", "120"))    # revisa la pantalla aunque no abra inventario
 MIN_CONF = float(os.getenv("MIN_CONFIDENCE", "0.8"))  # seguridad mínima de la IA para contar un objeto
-INV_COOLDOWN = 15                                     # mín. segundos entre consultas con inventario abierto
+INV_COOLDOWN = 8                                      # mín. segundos entre consultas con inventario abierto
+BAR_DIFF = float(os.getenv("BAR_DIFF", "25"))        # sensibilidad del detector de cambios en la barra
+BAR_COOLDOWN = 8                                      # mín. segundos entre consultas por cambio en la barra
 ALERT_COOLDOWN = 600                                  # no repetir el mismo aviso en 10 min
-FRAME_EVERY = 3                                       # una imagen cada 3 s
+FRAME_EVERY = 2                                       # una imagen cada 2 s
 W, H = 1280, 720
 
 lock = threading.Lock()
@@ -34,8 +39,10 @@ items = [s.strip() for s in os.getenv("ITEMS",
 usage = {"day": "", "count": 0}
 client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
 last_call = [0.0]
+dead = set()                       # modelos que no existen en tu cuenta (404): no se vuelven a llamar
+pool = ThreadPoolExecutor(8)
 
-VERSION = "v6"
+VERSION = "v8"
 debug = deque(maxlen=20)           # últimas consultas a la IA: recorte + respuesta, para ver por qué falla
 
 PROMPT = """Eres experto en Minecraft. Esta imagen es un recorte ampliado del directo de un jugador de DonutSMP: {where}.
@@ -47,10 +54,12 @@ PASO 2 - Solo con esas casillas, di cuáles son EXACTAMENTE uno de estos objetos
 Confusiones típicas, NO las cometas:
 - Obsidiana (negra/morada) NO es Bloque de Netherite (gris oscuro marrón con rayas).
 - Herramientas/armadura de diamante (azul claro) NO son de Netherite (gris oscuro casi negro).
-- Los iconos de armadura a la derecha de la barra son el indicador de armadura puesta: una pechera NO es una Elytra.
+- La Elytra son DOS ALAS grises/moradas plegadas, con forma de V o de capa. Si sale en la barra, en el inventario
+  o en el indicador de armadura (iconos a la derecha de la barra, en el hueco del pecho), SÍ cuenta: la lleva puesta.
+  Una pechera normal (con mangas, color diamante/hierro/netherite) NO es una Elytra.
 - Un objeto con brillo morado NO es Manzana de oro encantada salvo que sea una manzana dorada brillante.
 - Ignora chat, webcam, carteles, marcos y bloques del mundo.
-Si dudas lo más mínimo, NO lo pongas. Lo normal es que "items" salga vacía.
+Si no estás seguro, NO lo pongas.
 Copia "name" EXACTAMENTE como aparece en la lista.
 
 Responde solo JSON:
@@ -96,6 +105,20 @@ def thumb(frame):
     return np.asarray(Image.fromarray(frame).convert("L").resize((64, 36)), dtype=np.int16)
 
 
+def bar_thumb(frame):
+    """Solo las casillas centrales de la barra rápida: si cambian, el streamer ha cogido/cambiado algo."""
+    h, w, _ = frame.shape
+    bar = frame[int(h * .95):, int(w * .38):int(w * .62)]
+    return np.asarray(Image.fromarray(bar).convert("L").resize((72, 6)), dtype=np.int16)
+
+
+def bar_changed(a, b):
+    """Diferencia por trozos de la barra: basta con que UNA casilla cambie mucho (cogió otro objeto)."""
+    # ponytail: 24 trozos fijos (~1 casilla = 3 trozos); con GUI scale muy grande o pequeña las casillas no caen justas, pero sigue detectando
+    cols = np.abs(a - b).reshape(6, 24, 3).mean(axis=(0, 2))
+    return cols.max() > BAR_DIFF
+
+
 def to_jpg(frame):
     buf = io.BytesIO()
     Image.fromarray(frame).save(buf, "JPEG", quality=80)
@@ -106,29 +129,60 @@ def busy(e):
     return any(k in str(e) for k in ("503", "UNAVAILABLE", "overloaded"))
 
 
-def analyze(img, where):
-    contents = [types.Part.from_bytes(data=to_jpg(img), mime_type="image/jpeg"),
-                PROMPT.format(where=where, items=", ".join(items))]
-    cfg = types.GenerateContentConfig(response_mime_type="application/json", temperature=0)
-    # Gemini gratis a veces está saturado (503): reintenta y, si sigue, prueba el modelo de reserva
-    for n, model in enumerate([GEMINI_MODEL, GEMINI_MODEL, FALLBACK_MODEL]):
+def parse(text):
+    m = re.search(r"\{.*\}", text or "", re.S)       # Gemma a veces mete ```json ... ``` alrededor
+    return json.loads(m.group(0) if m else "{}")
+
+
+def ask(model, jpg, prompt):
+    """Una IA. Devuelve su JSON o lanza el error. Reintenta una vez si está saturada."""
+    cfg = types.GenerateContentConfig(temperature=0, **(
+        {"response_mime_type": "application/json"} if model.startswith("gemini") else {}))
+    for n in range(2):
         try:
-            r = client.models.generate_content(model=model, contents=contents, config=cfg)
-            break
+            r = client.models.generate_content(
+                model=model, contents=[types.Part.from_bytes(data=jpg, mime_type="image/jpeg"), prompt], config=cfg)
+            return parse(r.text)
         except Exception as e:
-            if not busy(e) or n == 2:
+            if "404" in str(e) or "not found" in str(e).lower():
+                dead.add(model)
+            if not busy(e) or n == 1:
                 raise
-            time.sleep(3)
-    data = json.loads(r.text)
+            time.sleep(2)
+
+
+def analyze(img, where):
+    jpg, prompt = to_jpg(img), PROMPT.format(where=where, items=", ".join(items))
+    models = [m for m in MODELS if m not in dead]
+    futures = {m: pool.submit(ask, m, jpg, prompt) for m in models}
     allowed = {i.lower(): i for i in items}
-    out = []
-    for i in data.get("items", []):
-        name = allowed.get(str(i.get("name", "")).strip().lower())   # fuera lo que no esté en tu lista
-        if name and float(i.get("confidence") or 0) >= MIN_CONF:
-            out.append({**i, "name": name})
+    votes, best, report, slots = {}, {}, [], []
+    for m, f in futures.items():
+        try:
+            data = f.result(timeout=40)
+        except Exception as e:
+            report.append({"model": m, "error": str(e)[:90]})
+            continue
+        slots = slots or data.get("slots", [])
+        mine = []
+        for i in data.get("items", []):
+            name = allowed.get(str(i.get("name", "")).strip().lower())   # fuera lo que no esté en tu lista
+            conf = float(i.get("confidence") or 0)
+            if name and conf >= MIN_CONF and name not in mine:
+                mine.append(name)
+                votes[name] = votes.get(name, 0) + 1
+                if conf > best.get(name, {}).get("confidence", -1):
+                    best[name] = {**i, "name": name, "confidence": conf}
+        report.append({"model": m, "items": mine})
+    answered = sum(1 for r in report if "error" not in r)
+    if not answered:
+        raise Exception(report[0]["error"] if report else "no hay modelos disponibles")
+    # ponytail: si solo responde 1 IA, decide ella sola; con 2+ hace falta que VOTES estén de acuerdo
+    need = min(VOTES, answered)
+    out = [{**best[n], "votes": f"{v}/{answered}"} for n, v in votes.items() if v >= need]
     debug.appendleft({"id": hashlib.md5(f"{time.time()}".encode()).hexdigest()[:10], "time": time.time(),
-                      "where": where, "slots": data.get("slots", []), "raw": data.get("items", []),
-                      "kept": [i["name"] for i in out], "jpg": to_jpg(img)})
+                      "where": where, "slots": slots, "votes": report,
+                      "kept": [i["name"] for i in out], "jpg": jpg})
     return out
 
 
@@ -138,7 +192,7 @@ def send_discord(st, found, jpg, reason):
     payload = {"username": "Vigía DonutSMP", "embeds": [{
         "title": f"🚨 {st['name']} lleva algo valioso", "url": st["url"], "description": lines,
         "color": 0xE74C3C, "image": {"url": "attachment://captura.jpg"},
-        "footer": {"text": f"Detectado por: {reason} (confirmado en 2 fotogramas)"}}]}
+        "footer": {"text": f"Detectado por: {reason} · IAs de acuerdo: {found[0].get('votes', '?')}"}}]}
     if WEBHOOK:
         requests.post(WEBHOOK, data={"payload_json": json.dumps(payload)},
                       files={"files[0]": ("captura.jpg", jpg, "image/jpeg")}, timeout=20)
@@ -150,14 +204,13 @@ def handle_frame(sid, frame):
         return
     jpg = to_jpg(frame)
     st["frame"] = jpg
-    now, small, inv = time.time(), thumb(frame), inventory_open(frame)
-    changed = st["sent"] is None or np.abs(small - st["sent"]).mean() > 6
-    pend = st["pending"]
-    if pend:                                   # algo visto en el fotograma anterior → confirmar con este
-        reason, inv = pend["reason"], pend["inv"]
-    elif inv and changed and now - st["last_ai"] >= INV_COOLDOWN:
+    now, small, bar, inv = time.time(), thumb(frame), bar_thumb(frame), inventory_open(frame)
+    since = now - st["last_ai"]
+    if inv and (st["sent"] is None or np.abs(small - st["sent"]).mean() > 6) and since >= INV_COOLDOWN:
         reason = "inventario abierto"
-    elif now - st["last_ai"] >= PERIODIC:
+    elif not inv and st["bar"] is not None and bar_changed(bar, st["bar"]) and since >= BAR_COOLDOWN:
+        reason = "cambio en la barra"
+    elif since >= PERIODIC:
         reason = "revisión periódica"
     else:
         return
@@ -167,23 +220,15 @@ def handle_frame(sid, frame):
     if not take_budget():
         st["status"] = "límite diario de IA alcanzado"
         return
-    st["last_ai"], st["sent"], st["pending"] = now, small, None
+    st["last_ai"], st["sent"], st["bar"] = now, small, bar
     try:
         found = analyze(*crop(frame, inv))
-    except Exception as e:  # cuota, red, JSON raro: se registra y seguimos
-        st["status"] = "IA saturada, reintento en breve" if busy(e) else \
+    except Exception as e:  # todas las IAs fallaron: se registra y seguimos
+        st["status"] = "IAs saturadas, reintento en breve" if busy(e) else \
             "límite gratis de IA agotado" if "429" in str(e) else f"error IA: {str(e)[:60]}"
-        st["last_ai"] = now - PERIODIC + 30      # vuelve a intentarlo en ~30 s, no en 2 min
+        st["last_ai"] = now - PERIODIC + 30      # vuelve a intentarlo en ~30 s
         return
-    st["status"] = "en directo"
-    if not pend:
-        if found:
-            st["pending"] = {"reason": reason, "inv": inv, "names": {i["name"] for i in found}}
-        else:
-            st["last_items"] = []
-        return
-    found = [i for i in found if i["name"] in pend["names"]]   # solo lo que salió las dos veces
-    st["last_items"] = found
+    st["status"], st["last_items"] = "en directo", found
     key = ",".join(sorted(i["name"] for i in found))
     if not found or (key == st["last_key"] and now - st["last_alert"] < ALERT_COOLDOWN):
         return
@@ -245,7 +290,7 @@ def add_streamer(url):
             return sid
         streamers[sid] = {"url": url, "name": url.split("/")[-1].lstrip("@"), "status": "iniciando",
                           "frame": None, "sent": None, "last_ai": 0, "last_items": [],
-                          "last_key": "", "last_alert": 0, "pending": None}
+                          "last_key": "", "last_alert": 0, "bar": None}
     threading.Thread(target=watch, args=(sid,), daemon=True).start()
     return sid
 
@@ -279,6 +324,7 @@ def state():
                       for k, v in list(streamers.items())],
         "alerts": [{k: v for k, v in a.items() if k != "jpg"} for a in alerts],
         "items": items, "usage": usage["count"], "limit": DAILY_LIMIT, "version": VERSION,
+        "models": [m for m in MODELS if m not in dead], "need": VOTES,
         "debug": [{k: v for k, v in d.items() if k != "jpg"} for d in debug],
         "ready": {"gemini": bool(client), "discord": bool(WEBHOOK), "password": bool(PASSWORD)},
     }

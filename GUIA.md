@@ -52,14 +52,16 @@ Con eso se mantiene despierto. Render da 750 horas gratis al mes, que alcanzan p
 ## Ajustes opcionales (variables de entorno en Render)
 | Variable | Por defecto | Qué hace |
 |---|---|---|
-| `DAILY_LIMIT` | 250 | máximo de consultas a la IA al día. Bájalo si Gemini da error de cuota |
-| `PERIODIC_CHECK` | 120 | cada cuántos segundos revisa la pantalla aunque no abra el inventario |
-| `GEMINI_MODEL` | gemini-flash-latest | modelo de Gemini. `gemini-flash-lite-latest` da más consultas gratis pero se equivoca más |
-| `MIN_CONFIDENCE` | 0.8 | seguridad mínima de la IA (0 a 1). Súbela si sigue habiendo falsos avisos |
+| `MODELS` | gemini-flash-latest,gemini-flash-lite-latest,gemma-3-27b-it | las IAs que votan, separadas por comas. Cada una tiene su propio cupo gratis |
+| `VOTES` | 2 | cuántas IAs tienen que estar de acuerdo para avisar. 1 = más avisos (y más falsos), 3 = casi sin falsos pero se le escapan cosas |
+| `DAILY_LIMIT` | 400 | máximo de revisiones al día |
+| `PERIODIC_CHECK` | 120 | cada cuántos segundos revisa aunque no pase nada |
+| `BAR_DIFF` | 25 | sensibilidad del detector de cambios en la barra. Más bajo = revisa más a menudo (gasta más cupo) |
+| `MIN_CONFIDENCE` | 0.8 | seguridad mínima de cada IA (0 a 1) |
 
 ## Si algo falla
-- **"error IA: ... 429 / RESOURCE_EXHAUSTED"** → te pasaste del límite gratis. Baja `DAILY_LIMIT` o sube `PERIODIC_CHECK`.
-- **"error IA: ... not found"** → el modelo cambió de nombre. Pon `GEMINI_MODEL` = `gemini-2.5-flash-lite`.
+- **"error IA: ... 429 / RESOURCE_EXHAUSTED"** → te pasaste del límite gratis. Baja `DAILY_LIMIT`, sube `PERIODIC_CHECK` o sube `BAR_DIFF`.
+- **Una IA sale con ✗ "not found" en "Lo que ve la IA"** → ese modelo ya no existe; el bot la deja de usar solo. Puedes quitarla de `MODELS`.
 - **Siempre "offline" aunque esté en directo** → en Render abre la pestaña **Logs** y pásale el error a Claude; puede que la plataforma bloquee el servidor.
 - **La imagen se queda congelada o va muy atrasada** → la CPU gratis no da abasto; vigila menos streamers a la vez (1–2 es lo seguro).
 - **No detecta cuando abre el inventario** → el streamer usa un texture pack que cambia el color de la GUI; seguirá avisando con la revisión periódica.
