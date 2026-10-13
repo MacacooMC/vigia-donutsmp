@@ -13,6 +13,7 @@ from PIL import Image
 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")  # Flash (no Lite): se inventa mucho menos
+FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK", "gemini-flash-lite-latest")  # si el principal está saturado
 WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
 PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "250"))    # consultas a Gemini por día (Flash gratis da menos que Lite)
@@ -34,7 +35,7 @@ usage = {"day": "", "count": 0}
 client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
 last_call = [0.0]
 
-VERSION = "v5"
+VERSION = "v6"
 debug = deque(maxlen=20)           # últimas consultas a la IA: recorte + respuesta, para ver por qué falla
 
 PROMPT = """Eres experto en Minecraft. Esta imagen es un recorte ampliado del directo de un jugador de DonutSMP: {where}.
@@ -101,12 +102,23 @@ def to_jpg(frame):
     return buf.getvalue()
 
 
+def busy(e):
+    return any(k in str(e) for k in ("503", "UNAVAILABLE", "overloaded"))
+
+
 def analyze(img, where):
-    r = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[types.Part.from_bytes(data=to_jpg(img), mime_type="image/jpeg"),
-                  PROMPT.format(where=where, items=", ".join(items))],
-        config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0))
+    contents = [types.Part.from_bytes(data=to_jpg(img), mime_type="image/jpeg"),
+                PROMPT.format(where=where, items=", ".join(items))]
+    cfg = types.GenerateContentConfig(response_mime_type="application/json", temperature=0)
+    # Gemini gratis a veces está saturado (503): reintenta y, si sigue, prueba el modelo de reserva
+    for n, model in enumerate([GEMINI_MODEL, GEMINI_MODEL, FALLBACK_MODEL]):
+        try:
+            r = client.models.generate_content(model=model, contents=contents, config=cfg)
+            break
+        except Exception as e:
+            if not busy(e) or n == 2:
+                raise
+            time.sleep(3)
     data = json.loads(r.text)
     allowed = {i.lower(): i for i in items}
     out = []
@@ -159,7 +171,9 @@ def handle_frame(sid, frame):
     try:
         found = analyze(*crop(frame, inv))
     except Exception as e:  # cuota, red, JSON raro: se registra y seguimos
-        st["status"] = f"error IA: {str(e)[:80]}"
+        st["status"] = "IA saturada, reintento en breve" if busy(e) else \
+            "límite gratis de IA agotado" if "429" in str(e) else f"error IA: {str(e)[:60]}"
+        st["last_ai"] = now - PERIODIC + 30      # vuelve a intentarlo en ~30 s, no en 2 min
         return
     st["status"] = "en directo"
     if not pend:
