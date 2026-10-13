@@ -77,6 +77,7 @@
   .bar i { display:block; height:100%; width:0; border-radius:99px; background:linear-gradient(90deg,var(--pink),var(--lav)); transition:width .9s var(--ease) }
   .dots { display:flex; gap:4px; margin-top:8px } .dots i { width:9px; height:9px; border-radius:50%; background:var(--line2); transition:background .3s }
   .dots i.ok { background:var(--green); box-shadow:0 0 8px var(--green) }
+  .dots i.cool { background:var(--amber) } .dots i.dead { background:var(--red); opacity:.5 }
   @keyframes rise-in { from { opacity:0; transform:translateY(16px) scale(.98) } }
 
   .warn { background:#3b2a0bcc; border:1.5px solid var(--amber); color:var(--amber); padding:10px 14px; border-radius:12px; margin-top:16px; font-size:14px; animation:rise-in .5s var(--ease) }
@@ -198,7 +199,7 @@
   <div class="stats">
     <div class="stat" style="animation-delay:.05s"><div class="k">📡 En directo</div><div class="v" id="sLive">0/0</div></div>
     <div class="stat" style="animation-delay:.12s"><div class="k">💎 Alertas hoy</div><div class="v" id="sAlerts">0</div></div>
-    <div class="stat" style="animation-delay:.19s"><div class="k">🧠 IAs votando</div><div class="v" id="sModels">0</div><div class="dots" id="dots"></div></div>
+    <div class="stat" style="animation-delay:.19s"><div class="k">🧠 IAs listas</div><div class="v" id="sModels">0</div><div class="dots" id="dots"></div></div>
     <div class="stat" style="animation-delay:.26s"><div class="k">⚡ Revisiones hoy</div><div class="v"><span id="use">0</span><small> / <span id="lim">0</span></small></div><div class="bar"><i id="useBar"></i></div></div>
   </div>
   <div id="warn"></div>
@@ -422,12 +423,12 @@ async function refresh() {
   setText($("ver"), s.version || "");
   setText($("sLive"), `${live}/${s.streamers.length}`);
   countTo($("sAlerts"), s.alerts.filter(a => new Date(a.time * 1000).toDateString() === today).length);
-  countTo($("sModels"), (s.models || []).length);
-  $("dots").innerHTML = (s.models || []).map(m => `<i class="ok" title="${esc(m)}"></i>`).join("");
+  countTo($("sModels"), (s.models || []).filter(m => m.state === "ok").length);
+  $("dots").innerHTML = (s.models || []).map(m => `<i class="${m.state}" title="${esc(m.name)}: ${{ok: "lista", cool: "sin cupo, descansando", dead: "no existe"}[m.state]}"></i>`).join("");
   countTo($("use"), s.usage); setText($("lim"), String(s.limit));
   $("useBar").style.width = Math.min(100, s.usage / s.limit * 100) + "%";
   ["cStreams", "cAlerts", "cDebug"].forEach((id, n) => setText($(id), String([s.streamers, s.alerts, s.debug || []][n].length)));
-  const miss = [!s.ready.gemini && "GEMINI_API_KEY", !s.ready.discord && "DISCORD_WEBHOOK", !s.ready.password && "ADMIN_PASSWORD"].filter(Boolean);
+  const miss = [!s.ready.ia && "una clave de IA (GROQ_API_KEY, GITHUB_TOKEN o GEMINI_API_KEY)", !s.ready.discord && "DISCORD_WEBHOOK", !s.ready.password && "ADMIN_PASSWORD"].filter(Boolean);
   const w = miss.length ? `Falta configurar en Render: ${miss.join(", ")}` : "";
   if ($("warn").textContent !== w) $("warn").innerHTML = w ? `<div class="warn">${w}</div>` : "";
   if (!itemsLoaded) { $("items").value = s.items.join("\n"); itemsLoaded = true; }

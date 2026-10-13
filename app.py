@@ -1,5 +1,5 @@
 """Vigía DonutSMP: mira directos, detecta objetos valiosos con Gemini y avisa por Discord."""
-import hashlib, io, json, os, re, subprocess, threading, time
+import base64, hashlib, io, json, os, re, subprocess, threading, time
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from datetime import datetime
@@ -13,13 +13,21 @@ from google.genai import types
 from PIL import Image
 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
-# Varias IAs miran la MISMA imagen a la vez y votan. Cada modelo tiene su propio cupo gratis.
-MODELS = [m.strip() for m in os.getenv("MODELS",
-          "gemini-flash-latest,gemini-flash-lite-latest,gemma-3-27b-it").split(",") if m.strip()]
-VOTES = int(os.getenv("VOTES", "2"))                  # cuántas IAs tienen que estar de acuerdo
+# IAs gratis (sin tarjeta) de 3 proveedores. Formato "proveedor:modelo". Las que no tengan clave se ignoran.
+KEYS = {"gemini": GEMINI_KEY, "groq": os.getenv("GROQ_API_KEY", ""), "github": os.getenv("GITHUB_TOKEN", ""),
+        "openrouter": os.getenv("OPENROUTER_API_KEY", "")}
+BASES = {"groq": "https://api.groq.com/openai/v1", "github": "https://models.github.ai/inference",
+         "openrouter": "https://openrouter.ai/api/v1"}
+csv = lambda name, default: [m.strip() for m in os.getenv(name, default).split(",") if m.strip()]
+# 1º mira una IA rápida y con mucho cupo. Solo si ve algo valioso, las mejores IAs lo confirman.
+SCREENERS = csv("SCREENERS", "groq:qwen/qwen3.8-27b,gemini:gemini-flash-lite-latest,github:openai/gpt-4.1-mini")
+JUDGES = csv("JUDGES", "github:openai/gpt-4.1,gemini:gemini-flash-latest,github:openai/gpt-4.1-mini,"
+                       "groq:qwen/qwen3.8-27b,gemini:gemini-flash-lite-latest")
+VOTES = int(os.getenv("VOTES", "2"))                  # cuántas IAs tienen que estar de acuerdo (contando la 1ª)
+JUDGES_PER_CHECK = int(os.getenv("JUDGES_PER_CHECK", "2"))  # cuántas IAs buenas confirman cada hallazgo
 WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
 PASSWORD = os.getenv("ADMIN_PASSWORD", "")
-DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "400"))    # revisiones por día (cada una consulta a todas las IAs)
+DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "900"))    # revisiones por día
 PERIODIC = int(os.getenv("PERIODIC_CHECK", "120"))    # revisa la pantalla aunque no abra inventario
 MIN_CONF = float(os.getenv("MIN_CONFIDENCE", "0.8"))  # seguridad mínima de la IA para contar un objeto
 INV_COOLDOWN = 8                                      # mín. segundos entre consultas con inventario abierto
@@ -40,9 +48,10 @@ usage = {"day": "", "count": 0}
 client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
 last_call = [0.0]
 dead = set()                       # modelos que no existen en tu cuenta (404): no se vuelven a llamar
+cooling = {}                       # modelo -> hasta cuándo descansa porque se quedó sin cupo (429)
 pool = ThreadPoolExecutor(8)
 
-VERSION = "v8"
+VERSION = "v9"
 debug = deque(maxlen=20)           # últimas consultas a la IA: recorte + respuesta, para ver por qué falla
 
 PROMPT = """Eres experto en Minecraft. Esta imagen es un recorte ampliado del directo de un jugador de DonutSMP: {where}.
@@ -134,52 +143,94 @@ def parse(text):
     return json.loads(m.group(0) if m else "{}")
 
 
-def ask(model, jpg, prompt):
-    """Una IA. Devuelve su JSON o lanza el error. Reintenta una vez si está saturada."""
-    cfg = types.GenerateContentConfig(temperature=0, **(
-        {"response_mime_type": "application/json"} if model.startswith("gemini") else {}))
+def ask(spec, jpg, prompt):
+    """Una IA ("proveedor:modelo"). Devuelve su JSON o lanza el error. Reintenta una vez si está saturada."""
+    prov, model = spec.split(":", 1)
     for n in range(2):
         try:
-            r = client.models.generate_content(
-                model=model, contents=[types.Part.from_bytes(data=jpg, mime_type="image/jpeg"), prompt], config=cfg)
-            return parse(r.text)
+            if prov == "gemini":
+                cfg = types.GenerateContentConfig(temperature=0, **(
+                    {"response_mime_type": "application/json"} if model.startswith("gemini") else {}))
+                r = client.models.generate_content(
+                    model=model, contents=[types.Part.from_bytes(data=jpg, mime_type="image/jpeg"), prompt], config=cfg)
+                return parse(r.text)
+            img = "data:image/jpeg;base64," + base64.b64encode(jpg).decode()
+            r = requests.post(BASES[prov] + "/chat/completions", timeout=40,
+                              headers={"Authorization": f"Bearer {KEYS[prov]}"},
+                              json={"model": model, "temperature": 0, "max_tokens": 1500, "messages": [{"role": "user", "content": [
+                                  {"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": img}}]}]})
+            if r.status_code >= 400:
+                raise Exception(f"{r.status_code} {r.text[:200]}")
+            text = r.json()["choices"][0]["message"]["content"] or ""
+            return parse(re.sub(r"<think>.*?</think>", "", text, flags=re.S))   # Qwen piensa en voz alta
         except Exception as e:
-            if "404" in str(e) or "not found" in str(e).lower():
-                dead.add(model)
+            msg = str(e)
+            if msg.startswith(("404", "400")) and ("model" in msg.lower() or "not found" in msg.lower()):
+                dead.add(spec)
+            if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+                cooling[spec] = time.time() + 15 * 60          # sin cupo: descansa 15 min y deja paso a otra
             if not busy(e) or n == 1:
                 raise
             time.sleep(2)
 
 
+def available(specs, skip=()):
+    now = time.time()
+    return [m for m in specs if m not in dead and m not in skip and KEYS.get(m.split(":", 1)[0])
+            and cooling.get(m, 0) < now]
+
+
+def vote(spec, data, allowed):
+    mine = {}
+    for i in data.get("items", []):
+        name = allowed.get(str(i.get("name", "")).strip().lower())   # fuera lo que no esté en tu lista
+        conf = float(i.get("confidence") or 0)
+        if name and conf >= MIN_CONF and conf > mine.get(name, {}).get("confidence", -1):
+            mine[name] = {**i, "name": name, "confidence": conf}
+    return mine
+
+
 def analyze(img, where):
     jpg, prompt = to_jpg(img), PROMPT.format(where=where, items=", ".join(items))
-    models = [m for m in MODELS if m not in dead]
-    futures = {m: pool.submit(ask, m, jpg, prompt) for m in models}
     allowed = {i.lower(): i for i in items}
-    votes, best, report, slots = {}, {}, [], []
-    for m, f in futures.items():
+    report, slots, results = [], [], {}
+    # Paso 1: una IA rápida mira. Si una se queda sin cupo, prueba la siguiente.
+    for spec in available(SCREENERS):
         try:
-            data = f.result(timeout=40)
+            data = ask(spec, jpg, prompt)
         except Exception as e:
-            report.append({"model": m, "error": str(e)[:90]})
+            report.append({"model": spec, "error": str(e)[:90]})
             continue
-        slots = slots or data.get("slots", [])
-        mine = []
-        for i in data.get("items", []):
-            name = allowed.get(str(i.get("name", "")).strip().lower())   # fuera lo que no esté en tu lista
-            conf = float(i.get("confidence") or 0)
-            if name and conf >= MIN_CONF and name not in mine:
-                mine.append(name)
-                votes[name] = votes.get(name, 0) + 1
-                if conf > best.get(name, {}).get("confidence", -1):
-                    best[name] = {**i, "name": name, "confidence": conf}
-        report.append({"model": m, "items": mine})
-    answered = sum(1 for r in report if "error" not in r)
-    if not answered:
-        raise Exception(report[0]["error"] if report else "no hay modelos disponibles")
-    # ponytail: si solo responde 1 IA, decide ella sola; con 2+ hace falta que VOTES estén de acuerdo
-    need = min(VOTES, answered)
-    out = [{**best[n], "votes": f"{v}/{answered}"} for n, v in votes.items() if v >= need]
+        slots, results[spec] = data.get("slots", []), vote(spec, data, allowed)
+        report.append({"model": spec, "items": list(results[spec])})
+        break
+    if not results:      # todas fallaron: se apunta igual en "Lo que ve la IA" para ver por qué
+        debug.appendleft({"id": hashlib.md5(f"{time.time()}".encode()).hexdigest()[:10], "time": time.time(),
+                          "where": where, "slots": [], "votes": report or [{"model": "—", "error":
+                          "ninguna IA disponible: faltan claves o todas están sin cupo"}], "kept": [], "jpg": jpg})
+        raise Exception(report[-1]["error"] if report else "429 no hay ninguna IA disponible (revisa las claves)")
+    screener = next(iter(results))
+    # Paso 2: solo si vio algo, las mejores IAs disponibles lo confirman a la vez
+    if results[screener]:
+        judges = available(JUDGES, skip={screener})[:JUDGES_PER_CHECK]
+        futures = {m: pool.submit(ask, m, jpg, prompt) for m in judges}
+        for m, f in futures.items():
+            try:
+                data = f.result(timeout=45)
+            except Exception as e:
+                report.append({"model": m, "error": str(e)[:90]})
+                continue
+            results[m] = vote(m, data, allowed)
+            report.append({"model": m, "items": list(results[m])})
+    votes, best = {}, {}
+    for mine in results.values():
+        for name, info in mine.items():
+            votes[name] = votes.get(name, 0) + 1
+            if info["confidence"] > best.get(name, {}).get("confidence", -1):
+                best[name] = info
+    # ponytail: si no queda ninguna IA para confirmar, decide la primera sola
+    need = min(VOTES, len(results))
+    out = [{**best[n], "votes": f"{v}/{len(results)}"} for n, v in votes.items() if v >= need]
     debug.appendleft({"id": hashlib.md5(f"{time.time()}".encode()).hexdigest()[:10], "time": time.time(),
                       "where": where, "slots": slots, "votes": report,
                       "kept": [i["name"] for i in out], "jpg": jpg})
@@ -214,8 +265,8 @@ def handle_frame(sid, frame):
         reason = "revisión periódica"
     else:
         return
-    if not client:
-        st["status"] = "falta GEMINI_API_KEY"
+    if not any(KEYS.values()):
+        st["status"] = "falta una clave de IA"
         return
     if not take_budget():
         st["status"] = "límite diario de IA alcanzado"
@@ -324,9 +375,10 @@ def state():
                       for k, v in list(streamers.items())],
         "alerts": [{k: v for k, v in a.items() if k != "jpg"} for a in alerts],
         "items": items, "usage": usage["count"], "limit": DAILY_LIMIT, "version": VERSION,
-        "models": [m for m in MODELS if m not in dead], "need": VOTES,
+        "models": [{"name": m, "state": "dead" if m in dead else "cool" if cooling.get(m, 0) > time.time() else "ok"}
+                   for m in dict.fromkeys(SCREENERS + JUDGES) if KEYS.get(m.split(":", 1)[0])], "need": VOTES,
         "debug": [{k: v for k, v in d.items() if k != "jpg"} for d in debug],
-        "ready": {"gemini": bool(client), "discord": bool(WEBHOOK), "password": bool(PASSWORD)},
+        "ready": {"ia": any(KEYS.values()), "discord": bool(WEBHOOK), "password": bool(PASSWORD)},
     }
 
 
