@@ -44,7 +44,7 @@
 <body>
 <div class="wrap">
   <header>
-    <h1>VIGÍA <span>DONUTSMP</span></h1>
+    <h1>VIGÍA <span>DONUTSMP</span> <small id="ver" style="font-size:12px;color:var(--muted)"></small></h1>
     <div class="meter">Consultas IA hoy: <span id="use">0</span> / <span id="lim">0</span><div class="bar"><i id="useBar" style="width:0"></i></div></div>
   </header>
   <div id="warn"></div>
@@ -54,6 +54,12 @@
 
   <h2>Últimas alertas</h2>
   <div id="alerts" class="grid" style="grid-template-columns:1fr"></div>
+
+  <details>
+    <summary>Lo que ve la IA (últimas 20 consultas)</summary>
+    <p class="items">Si salta un falso aviso, haz captura de esta sección y pásala.</p>
+    <div id="debug" class="grid" style="grid-template-columns:1fr"></div>
+  </details>
 
   <details>
     <summary>Panel de admin</summary>
@@ -86,6 +92,13 @@ const say = t => $("msg").textContent = t;
 
 async function refresh() {
   let s; try { s = await api("GET", "/api/state"); } catch (e) { return; }
+  $("ver").textContent = s.version || "";
+  $("debug").innerHTML = (s.debug || []).map(d => `<div class="card body">
+      <a href="/api/debug/${d.id}" target="_blank"><img src="/api/debug/${d.id}" alt="recorte" style="width:100%;border-radius:6px"></a>
+      <div class="row"><span class="items">${esc(d.where)}</span><span class="pill">${new Date(d.time * 1000).toLocaleTimeString()}</span></div>
+      <div class="items">Casillas: ${d.slots.map(esc).join(" · ") || "—"}</div>
+      <div class="items">IA dijo: ${d.raw.map(i => esc(i.name) + " (" + esc(i.confidence) + ") " + esc(i.seen || "")).join(" · ") || "nada"}</div>
+      <p><b>Cuenta como: ${d.kept.map(esc).join(", ") || "nada"}</b></p></div>`).join("") || `<div class="empty">Todavía no ha consultado a la IA.</div>`;
   $("use").textContent = s.usage; $("lim").textContent = s.limit;
   $("useBar").style.width = Math.min(100, s.usage / s.limit * 100) + "%";
   const miss = [!s.ready.gemini && "GEMINI_API_KEY", !s.ready.discord && "DISCORD_WEBHOOK", !s.ready.password && "ADMIN_PASSWORD"].filter(Boolean);
@@ -104,7 +117,7 @@ async function refresh() {
       <a href="/api/alert/${a.id}" target="_blank"><img src="/api/alert/${a.id}" alt="captura"></a>
       <div><div class="row"><a class="name" href="${esc(a.url)}" target="_blank" rel="noopener">${esc(a.streamer)}</a>
       <span class="pill">${new Date(a.time * 1000).toLocaleTimeString()}</span></div>
-      <p><b>${fmt(a.items)}</b></p><div class="items">Detectado por ${esc(a.reason)}</div></div></div>`).join("")
+      <p><b>${fmt(a.items)}</b></p><div class="items">${a.items.map(i => esc(i.seen || "")).filter(Boolean).join(" · ")}</div><div class="items">Detectado por ${esc(a.reason)}</div></div></div>`).join("")
     : `<div class="empty">Sin alertas todavía.</div>`;
 }
 async function addS() { try { await api("POST", "/api/streamers", { url: $("url").value }); $("url").value = ""; say("Añadido."); refresh(); } catch (e) { say(e.message); } }

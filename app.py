@@ -34,14 +34,26 @@ usage = {"day": "", "count": 0}
 client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
 last_call = [0.0]
 
-PROMPT = """Eres experto en Minecraft. Esta imagen es un recorte del directo de un jugador de DonutSMP: {where}.
-Busca SOLO estos objetos: {items}.
-Cuidado: muchos jugadores usan texture packs y mods de HUD. Los iconos pequeños a la derecha de la barra rápida
-son el indicador de armadura puesta: una pechera NO es una Elytra. Ignora el chat, la webcam, carteles, bloques del mundo
-y objetos de otros jugadores. Si un icono no es inconfundiblemente uno de la lista, NO lo pongas.
-Lo normal es que la lista salga vacía.
+VERSION = "v4"
+debug = deque(maxlen=20)           # últimas consultas a la IA: recorte + respuesta, para ver por qué falla
+
+PROMPT = """Eres experto en Minecraft. Esta imagen es un recorte ampliado del directo de un jugador de DonutSMP: {where}.
+
+PASO 1 - Describe TODAS las casillas que veas, una por una, de izquierda a derecha y de arriba abajo:
+qué objeto hay (o "vacía") y el número si lo tiene. Describe lo que VES (color, forma), no lo que te gustaría ver.
+PASO 2 - Solo con esas casillas, di cuáles son EXACTAMENTE uno de estos objetos: {items}.
+
+Confusiones típicas, NO las cometas:
+- Obsidiana (negra/morada) NO es Bloque de Netherite (gris oscuro marrón con rayas).
+- Herramientas/armadura de diamante (azul claro) NO son de Netherite (gris oscuro casi negro).
+- Los iconos de armadura a la derecha de la barra son el indicador de armadura puesta: una pechera NO es una Elytra.
+- Un objeto con brillo morado NO es Manzana de oro encantada salvo que sea una manzana dorada brillante.
+- Ignora chat, webcam, carteles, marcos y bloques del mundo.
+Si dudas lo más mínimo, NO lo pongas. Lo normal es que "items" salga vacía.
 Copia "name" EXACTAMENTE como aparece en la lista.
-Responde solo JSON: {{"items":[{{"name":"...","count":numero_o_null,"confidence":0.0_a_1.0,"seen":"qué icono ves y dónde"}}]}}"""
+
+Responde solo JSON:
+{{"slots":["casilla 1: ...","casilla 2: ..."],"items":[{{"name":"...","count":numero_o_null,"confidence":0.0_a_1.0,"seen":"casilla N: qué ves"}}]}}"""
 
 
 def crop(frame, inv):
@@ -95,12 +107,16 @@ def analyze(img, where):
         contents=[types.Part.from_bytes(data=to_jpg(img), mime_type="image/jpeg"),
                   PROMPT.format(where=where, items=", ".join(items))],
         config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0))
+    data = json.loads(r.text)
     allowed = {i.lower(): i for i in items}
     out = []
-    for i in json.loads(r.text).get("items", []):
+    for i in data.get("items", []):
         name = allowed.get(str(i.get("name", "")).strip().lower())   # fuera lo que no esté en tu lista
         if name and float(i.get("confidence") or 0) >= MIN_CONF:
             out.append({**i, "name": name})
+    debug.appendleft({"id": hashlib.md5(f"{time.time()}".encode()).hexdigest()[:10], "time": time.time(),
+                      "where": where, "slots": data.get("slots", []), "raw": data.get("items", []),
+                      "kept": [i["name"] for i in out], "jpg": to_jpg(img)})
     return out
 
 
@@ -248,7 +264,8 @@ def state():
                        "has_frame": v["frame"] is not None, "last_items": v["last_items"]}
                       for k, v in list(streamers.items())],
         "alerts": [{k: v for k, v in a.items() if k != "jpg"} for a in alerts],
-        "items": items, "usage": usage["count"], "limit": DAILY_LIMIT,
+        "items": items, "usage": usage["count"], "limit": DAILY_LIMIT, "version": VERSION,
+        "debug": [{k: v for k, v in d.items() if k != "jpg"} for d in debug],
         "ready": {"gemini": bool(client), "discord": bool(WEBHOOK), "password": bool(PASSWORD)},
     }
 
@@ -266,6 +283,14 @@ def alert_img(aid: str):
     for a in alerts:
         if a["id"] == aid:
             return Response(a["jpg"], media_type="image/jpeg")
+    raise HTTPException(404)
+
+
+@app.get("/api/debug/{did}")
+def debug_img(did: str):
+    for d in debug:
+        if d["id"] == did:
+            return Response(d["jpg"], media_type="image/jpeg")
     raise HTTPException(404)
 
 

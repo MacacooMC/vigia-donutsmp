@@ -52,9 +52,10 @@ Con eso se mantiene despierto. Render da 750 horas gratis al mes, que alcanzan p
 ## Ajustes opcionales (variables de entorno en Render)
 | Variable | Por defecto | Qué hace |
 |---|---|---|
-| `DAILY_LIMIT` | 900 | máximo de consultas a la IA al día. Bájalo si Gemini da error de cuota |
+| `DAILY_LIMIT` | 250 | máximo de consultas a la IA al día. Bájalo si Gemini da error de cuota |
 | `PERIODIC_CHECK` | 120 | cada cuántos segundos revisa la pantalla aunque no abra el inventario |
-| `GEMINI_MODEL` | gemini-flash-lite-latest | modelo de Gemini; cámbialo si Google lo retira |
+| `GEMINI_MODEL` | gemini-flash-latest | modelo de Gemini. `gemini-flash-lite-latest` da más consultas gratis pero se equivoca más |
+| `MIN_CONFIDENCE` | 0.8 | seguridad mínima de la IA (0 a 1). Súbela si sigue habiendo falsos avisos |
 
 ## Si algo falla
 - **"error IA: ... 429 / RESOURCE_EXHAUSTED"** → te pasaste del límite gratis. Baja `DAILY_LIMIT` o sube `PERIODIC_CHECK`.
