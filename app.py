@@ -34,7 +34,7 @@ usage = {"day": "", "count": 0}
 client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
 last_call = [0.0]
 
-VERSION = "v4"
+VERSION = "v5"
 debug = deque(maxlen=20)           # últimas consultas a la IA: recorte + respuesta, para ver por qué falla
 
 PROMPT = """Eres experto en Minecraft. Esta imagen es un recorte ampliado del directo de un jugador de DonutSMP: {where}.
