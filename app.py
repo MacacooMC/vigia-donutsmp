@@ -13,16 +13,19 @@ from google.genai import types
 from PIL import Image, ImageDraw, ImageFont
 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
-# IAs gratis (sin tarjeta) de 3 proveedores. Formato "proveedor:modelo". Las que no tengan clave se ignoran.
-KEYS = {"gemini": GEMINI_KEY, "groq": os.getenv("GROQ_API_KEY", ""), "github": os.getenv("GITHUB_TOKEN", ""),
-        "openrouter": os.getenv("OPENROUTER_API_KEY", "")}
-BASES = {"groq": "https://api.groq.com/openai/v1", "github": "https://models.github.ai/inference",
-         "openrouter": "https://openrouter.ai/api/v1"}
+# IAs gratis (sin tarjeta) de varios proveedores. Formato "proveedor:modelo". Las que no tengan clave se ignoran.
+CF_ACCOUNT = os.getenv("CF_ACCOUNT_ID", "")
+KEYS = {"gemini": GEMINI_KEY, "groq": os.getenv("GROQ_API_KEY", ""), "openrouter": os.getenv("OPENROUTER_API_KEY", ""),
+        "cloudflare": os.getenv("CF_API_TOKEN", "") if CF_ACCOUNT else "", "mistral": os.getenv("MISTRAL_API_KEY", "")}
+BASES = {"groq": "https://api.groq.com/openai/v1", "openrouter": "https://openrouter.ai/api/v1",
+         "cloudflare": f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT}/ai/v1", "mistral": "https://api.mistral.ai/v1"}
 csv = lambda name, default: [m.strip() for m in os.getenv(name, default).split(",") if m.strip()]
-# 1º mira una IA rápida y con mucho cupo. Solo si ve algo valioso, las mejores IAs lo confirman.
-SCREENERS = csv("SCREENERS", "groq:qwen/qwen3.8-27b,gemini:gemini-flash-lite-latest,github:openai/gpt-4.1-mini")
-JUDGES = csv("JUDGES", "github:openai/gpt-4.1,gemini:gemini-flash-latest,github:openai/gpt-4.1-mini,"
-                       "groq:qwen/qwen3.8-27b,gemini:gemini-flash-lite-latest")
+LLAMA4 = "cloudflare:@cf/meta/llama-4-scout-17b-16e-instruct"
+# 1º mira una IA rápida. Solo si ve algo, otras IAs lo confirman. Si una no tiene cupo, se usa la siguiente.
+SCREENERS = csv("SCREENERS", f"groq:qwen/qwen3.8-27b,{LLAMA4},gemini:gemini-flash-lite-latest")
+JUDGES = csv("JUDGES", f"gemini:gemini-flash-latest,{LLAMA4},openrouter:google/gemma-3-27b-it:free,"
+                       "cloudflare:@cf/mistralai/mistral-small-3.1-24b-instruct,groq:qwen/qwen3.8-27b,"
+                       "gemini:gemini-flash-lite-latest,mistral:mistral-large-latest")
 VOTES = int(os.getenv("VOTES", "2"))                  # cuántas IAs tienen que estar de acuerdo (contando la 1ª)
 JUDGES_PER_CHECK = int(os.getenv("JUDGES_PER_CHECK", "2"))  # cuántas IAs buenas confirman cada hallazgo
 WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
@@ -51,7 +54,7 @@ dead = set()                       # modelos que no existen en tu cuenta (404): 
 cooling = {}                       # modelo -> hasta cuándo descansa porque se quedó sin cupo (429)
 pool = ThreadPoolExecutor(8)
 
-VERSION = "v11"
+VERSION = "v14"
 debug = deque(maxlen=20)           # últimas consultas a la IA: recorte + respuesta, para ver por qué falla
 
 PROMPT = """Eres experto en Minecraft. Te paso UNA imagen con paneles del directo de un jugador de DonutSMP:
@@ -273,6 +276,18 @@ def parse(text):
     return json.loads(m.group(0) if m else "{}")
 
 
+GAP = {"mistral": 1.3}             # segundos mínimos entre peticiones al mismo proveedor (espera)
+REST = {"groq": int(os.getenv("GROQ_REST", "25"))}   # tras usar Groq, descansa: su cupo gratis es por minuto
+_last = {}
+
+
+def throttle(prov):
+    with lock:
+        t = max(time.time(), _last.get(prov, 0) + GAP.get(prov, 0))
+        _last[prov] = t
+    time.sleep(max(0, t - time.time()))
+
+
 def ask(spec, jpgs, prompt):
     """Una IA ("proveedor:modelo"). Devuelve su JSON o lanza el error. Reintenta una vez si está saturada."""
     prov, model = spec.split(":", 1)
@@ -284,18 +299,21 @@ def ask(spec, jpgs, prompt):
                 parts = [types.Part.from_bytes(data=j, mime_type="image/jpeg") for j in jpgs]
                 r = client.models.generate_content(model=model, contents=parts + [prompt], config=cfg)
                 return parse(r.text)
-            imgs = [{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(j).decode()}}
-                    for j in jpgs]
+            throttle(prov)
+            urls = ["data:image/jpeg;base64," + base64.b64encode(j).decode() for j in jpgs]
+            imgs = [{"type": "image_url", "image_url": u if prov == "mistral" else {"url": u}} for u in urls]
             body = {"model": model, "temperature": 0, "max_tokens": 1500, "messages": [{"role": "user", "content": [
                     {"type": "text", "text": prompt}] + imgs}]}
             headers = {"Authorization": f"Bearer {KEYS[prov]}", "Content-Type": "application/json",
-                       **({"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"} if prov == "github" else {})}
+                       }
             url = BASES[prov] + "/chat/completions"
             for _ in range(3):           # requests convierte el POST en GET al redirigir: lo seguimos a mano
                 r = requests.post(url, timeout=45, headers=headers, json=body, allow_redirects=False)
                 if r.status_code not in (301, 302, 307, 308):
                     break
                 url = r.headers["Location"]
+            if prov in REST:
+                cooling[spec] = max(cooling.get(spec, 0), time.time() + REST[prov])
             if r.status_code == 429:
                 wait = r.headers.get("retry-after")
                 cooling[spec] = time.time() + (float(wait) if wait and wait.replace(".", "").isdigit() else 90)
