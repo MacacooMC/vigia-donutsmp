@@ -1,5 +1,5 @@
 """Vigía DonutSMP: mira directos, detecta objetos valiosos con Gemini y avisa por Discord."""
-import base64, hashlib, io, json, os, re, subprocess, threading, time
+import base64, hashlib, io, json, os, re, subprocess, threading, time, unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from datetime import datetime
@@ -29,7 +29,8 @@ WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
 PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "900"))    # revisiones por día
 PERIODIC = int(os.getenv("PERIODIC_CHECK", "120"))    # revisa la pantalla aunque no abra inventario
-MIN_CONF = float(os.getenv("MIN_CONFIDENCE", "0.8"))  # seguridad mínima de la IA para contar un objeto
+MIN_CONF = float(os.getenv("MIN_CONFIDENCE", "0.7"))  # seguridad mínima para que una IA cuente como voto
+SCREEN_CONF = float(os.getenv("SCREEN_CONFIDENCE", "0.35"))  # con esto la IA rápida ya pide confirmación
 INV_COOLDOWN = 8                                      # mín. segundos entre consultas con inventario abierto
 BAR_DIFF = float(os.getenv("BAR_DIFF", "25"))        # sensibilidad del detector de cambios en la barra
 BAR_COOLDOWN = 8                                      # mín. segundos entre consultas por cambio en la barra
@@ -51,38 +52,67 @@ dead = set()                       # modelos que no existen en tu cuenta (404): 
 cooling = {}                       # modelo -> hasta cuándo descansa porque se quedó sin cupo (429)
 pool = ThreadPoolExecutor(8)
 
-VERSION = "v9"
+VERSION = "v10"
 debug = deque(maxlen=20)           # últimas consultas a la IA: recorte + respuesta, para ver por qué falla
 
-PROMPT = """Eres experto en Minecraft. Esta imagen es un recorte ampliado del directo de un jugador de DonutSMP: {where}.
+PROMPT = """Eres experto en Minecraft. Te paso 2 imágenes del directo de un jugador de DonutSMP:
+IMAGEN 1: la pantalla entera. IMAGEN 2: zoom de {where}.
 
-PASO 1 - Describe TODAS las casillas que veas, una por una, de izquierda a derecha y de arriba abajo:
-qué objeto hay (o "vacía") y el número si lo tiene. Describe lo que VES (color, forma), no lo que te gustaría ver.
-PASO 2 - Solo con esas casillas, di cuáles son EXACTAMENTE uno de estos objetos: {items}.
+Objetos que busco (usa el número):
+{items}
 
-Confusiones típicas, NO las cometas:
-- Obsidiana (negra/morada) NO es Bloque de Netherite (gris oscuro marrón con rayas).
-- Herramientas/armadura de diamante (azul claro) NO son de Netherite (gris oscuro casi negro).
-- La Elytra son DOS ALAS grises/moradas plegadas, con forma de V o de capa. Si sale en la barra, en el inventario
-  o en el indicador de armadura (iconos a la derecha de la barra, en el hueco del pecho), SÍ cuenta: la lleva puesta.
-  Una pechera normal (con mangas, color diamante/hierro/netherite) NO es una Elytra.
-- Un objeto con brillo morado NO es Manzana de oro encantada salvo que sea una manzana dorada brillante.
-- Ignora chat, webcam, carteles, marcos y bloques del mundo.
-Si no estás seguro, NO lo pongas.
-Copia "name" EXACTAMENTE como aparece en la lista.
+Dónde puede llevarlos el jugador (SÍ cuentan): en la mano, en la barra rápida, en su inventario o cofre abierto,
+en las casillas de armadura del inventario, en un indicador de armadura del HUD, o PUESTO en su personaje si se ve
+(tercera persona, planeando, reflejo en el inventario).
+NO cuentan: otros jugadores, marcos, carteles, tiendas, subastas, el chat, la webcam, bloques del mundo.
 
+Cómo reconocerlos:
+- Elytra (en español "Élitros"): dos alas grises/moradas tipo capa. En la barra/inventario es un icono gris con forma de alas.
+  Puesta se ve en la espalda en tercera persona, o en el hueco del pecho del inventario/HUD de armadura.
+- Netherite: gris muy oscuro, casi negro. Diamante es azul claro: NO es Netherite.
+- Obsidiana (negra con motas moradas) NO es Bloque de Netherite.
+- Tótem: muñequito dorado con cara verde. Manzana de oro encantada: manzana dorada que brilla morado.
+Pon confidence alta (0.8-1) si lo ves claro y baja (0.3-0.6) si crees que sí pero no estás seguro. Otra IA lo revisará.
+
+PASO 1: describe cada casilla de la barra (izquierda a derecha) y lo que lleve puesto o en la mano.
+PASO 2: lista los objetos de la lista que veas.
 Responde solo JSON:
-{{"slots":["casilla 1: ...","casilla 2: ..."],"items":[{{"name":"...","count":numero_o_null,"confidence":0.0_a_1.0,"seen":"casilla N: qué ves"}}]}}"""
+{{"slots":["casilla 1: ...","..."],"items":[{{"id":numero,"count":numero_o_null,"confidence":0.0_a_1.0,"seen":"dónde y qué ves"}}]}}"""
+
+# Nombres alternativos que puede usar la IA (en minúsculas y sin tildes)
+ALIASES = {"elytra": ["elitros", "elitro", "elytras", "alas"], "totem de la inmortalidad": ["totem", "totem of undying"],
+           "shulker box": ["caja de shulker", "shulker"], "spawner": ["generador", "generador de monstruos", "mob spawner"],
+           "beacon": ["faro"], "manzana de oro encantada": ["manzana de notch", "enchanted golden apple", "manzana encantada"]}
+
+
+def norm(t):
+    return unicodedata.normalize("NFD", str(t)).encode("ascii", "ignore").decode().lower().strip()
+
+
+def match(i):
+    """Qué objeto de tu lista es: por número, por nombre o por nombre alternativo (Élitros = Elytra)."""
+    try:
+        n = int(i.get("id"))
+        if 1 <= n <= len(items):
+            return items[n - 1]
+    except (TypeError, ValueError):
+        pass
+    name = norm(i.get("name", ""))
+    for it in items:
+        if name and (name == norm(it) or name in ALIASES.get(norm(it), [])):
+            return it
+    return None
 
 
 def crop(frame, inv):
-    """Solo la zona que importa, a resolución completa: así los iconos no quedan diminutos."""
+    """Pantalla entera (para ver la Elytra puesta, la mano, HUDs raros) + zoom de la zona importante."""
     h, w, _ = frame.shape
+    full = np.asarray(Image.fromarray(frame).resize((960, 540)))
     if inv:
-        return frame[int(h * .05):int(h * .95), int(w * .2):int(w * .8)], "su inventario o cofre abierto"
+        return [full, frame[int(h * .05):int(h * .95), int(w * .2):int(w * .8)]], "su inventario o cofre abierto"
     strip = frame[int(h * .75):, int(w * .2):int(w * .8)]
     big = Image.fromarray(strip).resize((strip.shape[1] * 2, strip.shape[0] * 2), Image.NEAREST)
-    return np.asarray(big), "su barra rápida (abajo) y el indicador de armadura"
+    return [full, np.asarray(big)], "su barra rápida (abajo) y el indicador de armadura"
 
 
 def take_budget():
@@ -143,7 +173,7 @@ def parse(text):
     return json.loads(m.group(0) if m else "{}")
 
 
-def ask(spec, jpg, prompt):
+def ask(spec, jpgs, prompt):
     """Una IA ("proveedor:modelo"). Devuelve su JSON o lanza el error. Reintenta una vez si está saturada."""
     prov, model = spec.split(":", 1)
     for n in range(2):
@@ -151,14 +181,15 @@ def ask(spec, jpg, prompt):
             if prov == "gemini":
                 cfg = types.GenerateContentConfig(temperature=0, **(
                     {"response_mime_type": "application/json"} if model.startswith("gemini") else {}))
-                r = client.models.generate_content(
-                    model=model, contents=[types.Part.from_bytes(data=jpg, mime_type="image/jpeg"), prompt], config=cfg)
+                parts = [types.Part.from_bytes(data=j, mime_type="image/jpeg") for j in jpgs]
+                r = client.models.generate_content(model=model, contents=parts + [prompt], config=cfg)
                 return parse(r.text)
-            img = "data:image/jpeg;base64," + base64.b64encode(jpg).decode()
+            imgs = [{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(j).decode()}}
+                    for j in jpgs]
             r = requests.post(BASES[prov] + "/chat/completions", timeout=40,
                               headers={"Authorization": f"Bearer {KEYS[prov]}"},
                               json={"model": model, "temperature": 0, "max_tokens": 1500, "messages": [{"role": "user", "content": [
-                                  {"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": img}}]}]})
+                                  {"type": "text", "text": prompt}] + imgs}]})
             if r.status_code >= 400:
                 raise Exception(f"{r.status_code} {r.text[:200]}")
             text = r.json()["choices"][0]["message"]["content"] or ""
@@ -180,51 +211,53 @@ def available(specs, skip=()):
             and cooling.get(m, 0) < now]
 
 
-def vote(spec, data, allowed):
+def vote(data, min_conf):
     mine = {}
     for i in data.get("items", []):
-        name = allowed.get(str(i.get("name", "")).strip().lower())   # fuera lo que no esté en tu lista
-        conf = float(i.get("confidence") or 0)
-        if name and conf >= MIN_CONF and conf > mine.get(name, {}).get("confidence", -1):
+        name, conf = match(i), float(i.get("confidence") or 0)
+        if name and conf >= min_conf and conf > mine.get(name, {}).get("confidence", -1):
             mine[name] = {**i, "name": name, "confidence": conf}
     return mine
 
 
-def analyze(img, where):
-    jpg, prompt = to_jpg(img), PROMPT.format(where=where, items=", ".join(items))
-    allowed = {i.lower(): i for i in items}
+def analyze(frame, inv):
+    imgs, where = crop(frame, inv)
+    jpgs = [to_jpg(i) for i in imgs]
+    prompt = PROMPT.format(where=where, items="\n".join(f"{n}. {it}" for n, it in enumerate(items, 1)))
     report, slots, results = [], [], {}
-    # Paso 1: una IA rápida mira. Si una se queda sin cupo, prueba la siguiente.
+    # Paso 1: una IA rápida mira. Es generosa (umbral bajo): mejor que pregunte de más a que se le escape.
     for spec in available(SCREENERS):
         try:
-            data = ask(spec, jpg, prompt)
+            data = ask(spec, jpgs, prompt)
         except Exception as e:
             report.append({"model": spec, "error": str(e)[:90]})
             continue
-        slots, results[spec] = data.get("slots", []), vote(spec, data, allowed)
+        slots, results[spec] = data.get("slots", []), vote(data, SCREEN_CONF)
         report.append({"model": spec, "items": list(results[spec])})
         break
     if not results:      # todas fallaron: se apunta igual en "Lo que ve la IA" para ver por qué
         debug.appendleft({"id": hashlib.md5(f"{time.time()}".encode()).hexdigest()[:10], "time": time.time(),
                           "where": where, "slots": [], "votes": report or [{"model": "—", "error":
-                          "ninguna IA disponible: faltan claves o todas están sin cupo"}], "kept": [], "jpg": jpg})
+                          "ninguna IA disponible: faltan claves o todas están sin cupo"}], "kept": [], "jpg": jpgs[-1]})
         raise Exception(report[-1]["error"] if report else "429 no hay ninguna IA disponible (revisa las claves)")
     screener = next(iter(results))
-    # Paso 2: solo si vio algo, las mejores IAs disponibles lo confirman a la vez
+    # Paso 2: solo si vio algo (aunque sea con dudas), las mejores IAs lo revisan a la vez
     if results[screener]:
         judges = available(JUDGES, skip={screener})[:JUDGES_PER_CHECK]
-        futures = {m: pool.submit(ask, m, jpg, prompt) for m in judges}
+        futures = {m: pool.submit(ask, m, jpgs, prompt) for m in judges}
         for m, f in futures.items():
             try:
                 data = f.result(timeout=45)
             except Exception as e:
                 report.append({"model": m, "error": str(e)[:90]})
                 continue
-            results[m] = vote(m, data, allowed)
+            results[m] = vote(data, MIN_CONF)
             report.append({"model": m, "items": list(results[m])})
     votes, best = {}, {}
     for mine in results.values():
         for name, info in mine.items():
+            if info["confidence"] < MIN_CONF:       # las dudas de la rápida no cuentan como voto
+                continue
             votes[name] = votes.get(name, 0) + 1
             if info["confidence"] > best.get(name, {}).get("confidence", -1):
                 best[name] = info
@@ -233,7 +266,7 @@ def analyze(img, where):
     out = [{**best[n], "votes": f"{v}/{len(results)}"} for n, v in votes.items() if v >= need]
     debug.appendleft({"id": hashlib.md5(f"{time.time()}".encode()).hexdigest()[:10], "time": time.time(),
                       "where": where, "slots": slots, "votes": report,
-                      "kept": [i["name"] for i in out], "jpg": jpg})
+                      "kept": [i["name"] for i in out], "jpg": jpgs[-1]})
     return out
 
 
@@ -273,7 +306,7 @@ def handle_frame(sid, frame):
         return
     st["last_ai"], st["sent"], st["bar"] = now, small, bar
     try:
-        found = analyze(*crop(frame, inv))
+        found = analyze(frame, inv)
     except Exception as e:  # todas las IAs fallaron: se registra y seguimos
         st["status"] = "IAs saturadas, reintento en breve" if busy(e) else \
             "límite gratis de IA agotado" if "429" in str(e) else f"error IA: {str(e)[:60]}"
