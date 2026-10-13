@@ -506,7 +506,8 @@ function makeDebug(d) {
       <div class="row"><span class="items">${esc(d.where)}</span><span class="ago" data-t="${d.time}">${ago(d.time)}</span></div>
       <div class="items">Casillas: ${(d.slots || []).map(esc).join(" · ") || "—"}</div>
       <div class="vote">${votes}</div>
-      <p style="margin:10px 0 0"><b style="color:var(--amber)">Cuenta como: ${d.kept.map(esc).join(", ") || "nada"}</b></p></div>`);
+      <p style="margin:10px 0 0"><b style="color:var(--amber)">Cuenta como: ${d.kept.map(esc).join(", ") || "nada"}</b></p>
+      ${d.has_full ? `<a class="items" style="color:var(--pink2)" href="/api/debug/${d.id}?full=1" target="_blank">ver la imagen exacta que recibió la IA (con la referencia) ↗</a>` : ""}</div>`);
 }
 
 async function refresh() {
